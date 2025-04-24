@@ -1,0 +1,124 @@
+import torch
+import torch.nn.functional as F
+from torch import nn
+import pickle
+import os
+import random as rd
+from utils import *
+from neurons import *
+
+def model_naval(train_data, train_label, val_data, val_label, n_iters, round, avm, variable_based):
+    nsample = train_data.shape[0]
+    val_nsample = val_data.shape[0]
+    length = train_data.shape[1]
+    dim = train_data.shape[2]
+
+    nf, nc = 8, 2
+    t1 = torch.randint(0, length-1, (nf,), dtype=torch.float64, requires_grad=True)
+    t2 = torch.randint(0, length-1, (nf,), dtype=torch.float64, requires_grad=True)
+    a = torch.rand(nf, dtype=torch.float64, requires_grad=True)
+    b = torch.rand(nf, dtype=torch.float64, requires_grad=True)
+    pc = torch.rand((nc, nf), requires_grad=True)
+    pd = torch.rand((1, nc), requires_grad=True)
+    tvar_temporal = torch.rand(nf, dtype=torch.float64, requires_grad=True)
+    tvar_logical_c = torch.rand(nc, dtype=torch.float64, requires_grad=True)
+    tvar_logical_d = torch.rand(1, dtype=torch.float64, requires_grad=True)
+    dimension = [0, 1] * (nf // 2)
+    temporal_type = ['temporal'] * nf if variable_based else ['F'] * (nf // 2) + ['G'] * (nf // 2)
+    logical_in = 'logical' if variable_based else 'and'
+    logical_out = 'logical' if variable_based else 'or'
+
+    tau = torch.tensor(0.1, requires_grad=False)
+    tau_pos = torch.tensor(0.1, dtype=torch.float64, requires_grad=True)
+    tau_neg = torch.tensor(0.1, dtype=torch.float64, requires_grad=True)
+
+    file = f'/initialization/case{round}.pkl'
+    path = os.getcwd() + file
+    if os.path.isfile(path):
+        with open(path, 'rb') as f:
+            a, b, t1, t2, pc, pd, tvar_temporal, tvar_logical_c, tvar_logical_d = pickle.load(f)
+    else:
+        os.makedirs(os.path.join(os.getcwd(), 'initialization'), exist_ok=True)
+        with open(os.path.join(os.getcwd(), 'initialization', f'case{round}.pkl'), 'wb') as f:
+            pickle.dump([a, b, t1, t2, pc, pd, tvar_temporal, tvar_logical_c, tvar_logical_d], f)
+
+    pred = [Predicate(a[i], b[i], dim=dimension[i]) for i in range(nf)]
+    temporal = [TemporalOperator(temporal_type[i], tau, t1[i], t2[i], avm=False, beta=2.5, tvar=tvar_temporal[i]) for i in range(nf)]
+    logical_c = [LogicalOperator(logical_in, dim=1, avm=avm, beta=2.5, tvar=tvar_logical_c[i]) for i in range(nc)]
+    logical_d = LogicalOperator(logical_out, dim=1, avm=avm, beta=2.5, tvar=tvar_logical_d)
+
+    Nmax = Normalization_max(dim=1)
+    optimizer = torch.optim.Adam([a, b, t1, t2, pc, pd, tvar_temporal, tvar_logical_c, tvar_logical_d, tau_pos, tau_neg], lr=0.1)
+    acc_best = 0
+
+    for epoch in range(1, n_iters):
+        rand_num = rd.sample(range(0, nsample), 64)
+        x = train_data[rand_num, :, :]
+        y = train_label[rand_num]
+        x = Nmax.forward(x)
+
+        r1o = torch.empty((x.shape[0], nf), dtype=torch.float64)
+        for k, (predi, Ti) in enumerate(zip(pred, temporal)):
+            r1 = predi.forward(x)
+            r1o[:, k] = Ti.forward(r1, padding=False)
+
+        rc = torch.empty((x.shape[0], nc), dtype=torch.float64)
+        for k, li in enumerate(logical_c):
+            rc[:, k] = li.forward(r1o, pc[k, :], keepdim=False)
+        R = logical_d.forward(rc, pd[0, :], keepdim=False)
+
+        pos_mask = y == 1
+        neg_mask = y == -1
+
+        coverage_loss = 0.0
+        if pos_mask.sum() > 0:
+            cp_pos = torch.sigmoid((R[pos_mask] - tau_pos) / 0.1)
+            coverage_loss += F.relu(0.95 - cp_pos.mean())
+        if neg_mask.sum() > 0:
+            cp_neg = torch.sigmoid((tau_neg - R[neg_mask]) / 0.1)
+            coverage_loss += F.relu(0.95 - cp_neg.mean())
+
+        bce_loss = F.binary_cross_entropy_with_logits(R.float(), ((y + 1) / 2).float())
+
+        pos_R = R[y == 1]
+        neg_R = R[y == -1]
+        if pos_R.numel() > 0 and neg_R.numel() > 0:
+            pos_to_neg = torch.cdist(pos_R.unsqueeze(1), neg_R.unsqueeze(1), p=2).min(dim=1)[0]
+            neg_to_pos = torch.cdist(neg_R.unsqueeze(1), pos_R.unsqueeze(1), p=2).min(dim=1)[0]
+            nonconformity_score = torch.cat([pos_to_neg, neg_to_pos], dim=0)
+            margin_loss = F.relu(1.0 - nonconformity_score.mean())
+        else:
+            margin_loss = torch.tensor(0.0, dtype=torch.float64)
+
+        R_hard = (R > 0).float()
+        hard_label = ((y + 1) / 2).float()
+        hard_loss = F.binary_cross_entropy(R_hard, hard_label)
+
+        total_loss = bce_loss + 2.0 * coverage_loss + 1.0 * margin_loss + 2.0 * hard_loss
+        total_loss.backward()
+
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if epoch % 100 == 0:
+            x_val = Nmax.forward(val_data)
+            r1o_val = torch.empty((val_nsample, nf), dtype=torch.float64)
+            for k, (predi, Ti) in enumerate(zip(pred, temporal)):
+                r1 = predi.forward(x_val)
+                r1o_val[:, k] = Ti.forward(r1, padding=False)
+            rc_val = torch.empty((val_nsample, nc), dtype=torch.float64)
+            for k, li in enumerate(logical_c):
+                rc_val[:, k] = li.forward(r1o_val, pc[k, :], keepdim=False)
+            R_val = logical_d.forward(rc_val, pd[0, :], keepdim=False)
+            pred_val = (R_val > 0).float() * 2 - 1
+            val_acc = torch.sum(pred_val == val_label) / val_nsample
+            print(f"epoch {epoch}, loss = {total_loss.item():.4f}, accuracy = {val_acc.item():.8f}")
+
+            if val_acc > acc_best:
+                acc_best = val_acc.item()
+                with open('W_best.pkl', 'wb') as f:
+                    pickle.dump([a, b, t1, t2, pc, pd, tvar_temporal, tvar_logical_c, tvar_logical_d], f)
+                with open('network_best.pkl', 'wb') as f:
+                    pickle.dump([pred, temporal, logical_c, logical_d], f)
+
+    return torch.tensor(acc_best), torch.sum(pc)
