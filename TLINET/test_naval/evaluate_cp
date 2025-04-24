@@ -1,0 +1,87 @@
+import os, sys, pickle
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+from neurons import *
+
+DATA_PATH = '/home/libbywang9/TLINET-DIFF_CP (opt1)/TLINET/test_naval/naval_dataset.pkl'
+W_PATH = '/home/libbywang9/TLINET-DIFF_CP (opt1)/TLINET/test_naval/W_best.pkl'
+NET_PATH = '/home/libbywang9/TLINET-DIFF_CP (opt1)/TLINET/test_naval/network_best.pkl'
+ALPHA = 0.05
+
+
+class Normalization_max:
+    def __init__(self, dim): self.dim = dim
+    def forward(self, x): return x / (x.max(dim=self.dim, keepdim=True)[0] + 1e-8)
+
+def infer(sample, pred, temporal, logical_c, logical_d, pc, pd, Nmax):
+    x = Nmax.forward(sample)
+    nf = len(pred)
+    r1o = torch.empty((sample.shape[0], nf), dtype=torch.float64)
+    for k, (predi, Ti) in enumerate(zip(pred, temporal)):
+        r1 = predi.forward(x)
+        r1o[:, k] = Ti.forward(r1, padding=False)
+    nc = len(logical_c)
+    rc = torch.empty((sample.shape[0], nc), dtype=torch.float64)
+    for k, li in enumerate(logical_c):
+        rc[:, k] = li.forward(r1o, pc[k, :], keepdim=False)
+    R = logical_d.forward(rc, pd[0, :], keepdim=False)
+    return R
+
+def evaluate_dual_threshold_cp(R, labels):
+    R_np = R.numpy()
+    labels_np = labels
+    pos = R_np[labels_np == 1]
+    neg = R_np[labels_np == -1]
+    tau_pos = np.quantile(pos, ALPHA)
+    tau_neg = np.quantile(neg, 1 - ALPHA)
+    cov_pos = np.mean(pos > tau_pos)
+    cov_neg = np.mean(neg < tau_neg)
+    cov_total = np.mean((R_np > tau_pos) | (R_np < tau_neg))
+    return tau_pos, tau_neg, cov_pos, cov_neg, cov_total, pos, neg
+
+if __name__ == '__main__':
+    with open(DATA_PATH, 'rb') as f:
+        _, _, val_data, val_label = pickle.load(f)
+    val_data = torch.tensor(val_data, dtype=torch.float64).permute(0, 2, 1)
+    val_label = torch.tensor(val_label, dtype=torch.int64).numpy()
+
+    with open(W_PATH, 'rb') as f:
+        a, b, t1, t2, pc, pd, tvar_temporal, tvar_logical_c, tvar_logical_d = pickle.load(f)
+    with open(NET_PATH, 'rb') as f:
+        pred, temporal, logical_c, logical_d = pickle.load(f)
+
+    Nmax = Normalization_max(dim=1)
+    with torch.no_grad():
+        R = infer(val_data, pred, temporal, logical_c, logical_d, pc, pd, Nmax).cpu().numpy()
+
+    true_labels = (val_label == 1).astype(int)
+    pred_labels = (R > 0).astype(int)
+
+    acc = np.mean(pred_labels == true_labels) * 100
+    fp = np.mean((pred_labels == 1) & (true_labels == 0)) * 100
+    fn = np.mean((pred_labels == 0) & (true_labels == 1)) * 100
+
+    print("[Direct Classification: R > 0]")
+    print(f"  Accuracy: {acc:.2f}%")
+    print(f"  False Positive Rate: {fp:.2f}%")
+    print(f"  False Negative Rate: {fn:.2f}%")
+
+    tau_pos, tau_neg, cov_pos, cov_neg, cov_total, pos_r, neg_r = evaluate_dual_threshold_cp(torch.tensor(R), val_label)
+    print("\n[Dual Threshold CP Evaluation]")
+    print(f"  tau_pos = {tau_pos:.4f}, tau_neg = {tau_neg:.4f}")
+    print(f"  Coverage - Overall: {cov_total:.3f}, Positive: {cov_pos:.3f}, Negative: {cov_neg:.3f}")
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(pos_r, bins=30, alpha=0.5, label="Label = 1")
+    plt.hist(neg_r, bins=30, alpha=0.5, label="Label = -1")
+    plt.axvline(x=0, color='black', linestyle='--', label="Threshold = 0")
+    plt.axvline(x=tau_pos, color='blue', linestyle='--', label=f"tau_pos={tau_pos:.2f}")
+    plt.axvline(x=tau_neg, color='red', linestyle='--', label=f"tau_neg={tau_neg:.2f}")
+    plt.xlabel("Robustness Score")
+    plt.ylabel("Frequency")
+    plt.title("Robustness Distribution with Thresholds")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
