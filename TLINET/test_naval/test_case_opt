@@ -1,0 +1,85 @@
+import torch
+import pickle
+import os
+from utils import *
+from robustness import *
+from model_naval2  import model_naval
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+
+data_path = os.path.join(os.path.dirname(__file__), "naval_dataset.pkl")
+with open(data_path, "rb") as f:
+    train_data, train_label, val_data, val_label = pickle.load(f)
+
+train_data = torch.tensor(train_data, dtype=torch.float64).permute(0, 2, 1)
+val_data = torch.tensor(val_data, dtype=torch.float64).permute(0, 2, 1)
+train_label = torch.tensor(train_label, dtype=torch.int64)
+val_label = torch.tensor(val_label, dtype=torch.int64)
+
+print("training sample: ", train_data.shape[0])
+print("val sample: ", val_data.shape[0])
+
+test_cases = 5
+desired_round_accuracy = 0.98
+desired_accuracy_consecutive = 0.98
+consecutive_K = 10
+consecutive_count = 0
+
+result_file = os.path.join(os.getcwd(), "result.pkl")
+if os.path.isfile(result_file):
+    with open(result_file, "rb") as f:
+        num_formula, acc = pickle.load(f)
+else:
+    num_formula, acc = [], []
+
+file_w = os.path.join(os.getcwd(), "W_best.pkl")
+file_network = os.path.join(os.getcwd(), "network_best.pkl")
+
+print("total round number is " + str(test_cases))
+
+for i in range(test_cases):
+    print("round " + str(i))
+    epoch = 10001
+    round_results = []
+
+    print("----- AveragedMax, DNF -----")
+    a1, n1 = model_naval(train_data, train_label, val_data, val_label, epoch, i, avm=True, variable_based=False)
+    a_hard = hard_accuracy(val_data, val_label, file_w, file_network)
+
+    print("neural network accuracy: ", a1.item(), "hard accuracy: ", a_hard.item())
+    if not torch.isclose(a1, a_hard.to(dtype=a1.dtype), atol=1e-3):
+        print("Warning: Hard accuracy does not match soft accuracy. Proceeding anyway.")
+
+    a1_val = a1.detach().numpy()
+    n1_val = n1.detach().numpy()
+    print("Accuracy (AveragedMax, DNF): {:.4f}".format(a1_val))
+    round_results.append(a1_val)
+
+    num_formula.append([n1_val, None, None, None])
+    acc.append([a1_val, None, None, None])
+
+    if a1_val >= desired_round_accuracy:
+        print("Round {}: AveragedMax, DNF reached desired accuracy {:.2f}%; skipping remaining methods for this round.".format(i, desired_round_accuracy * 100))
+        continue
+
+    valid_round_acc = [r for r in round_results if r is not None]
+    best_round_acc = max(valid_round_acc) if valid_round_acc else 0.0
+    print("Best accuracy for round {}: {:.4f}".format(i, best_round_acc))
+
+    if best_round_acc >= desired_accuracy_consecutive:
+        consecutive_count += 1
+    else:
+        consecutive_count = 0
+    print("Consecutive rounds meeting criteria: ", consecutive_count)
+
+    if consecutive_count >= consecutive_K:
+        print("Overall desired condition reached ({} consecutive rounds >= {:.2f}%), stopping further rounds.".format(consecutive_K, desired_accuracy_consecutive * 100))
+        break
+
+    with open(result_file, "wb") as f:
+        pickle.dump([num_formula, acc], f)
+
+print("Final results:")
+print("Number of formulas:", num_formula)
+print("Accuracies:", acc)
